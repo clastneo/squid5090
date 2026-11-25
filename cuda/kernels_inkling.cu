@@ -281,9 +281,10 @@ fused_depth_norm_kernel(
 // High-Occupancy Batched Cross-Pass Controllers (all 3 attn streams in parallel!)
 // ============================================================================
 
-// Kernel 1: msg = depth_attn(saved[1], prior_last, q[s]), cat = [norm(x), norm(msg)]
-// Grid: dim3(B, n_streams), Block: 256
-__global__ void __launch_bounds__(256)
+// Multi-SM Weight-Sharing PDL + ld_stream_u4 BF16 Cross-Pass Controller!
+// Shares BF16 controller weights ONCE across all B=1..8 tokens across 48-108 SMs (full 1.5 TB/s BW!).
+
+__global__ void __launch_bounds__(576)
 ctrl_prep_cat_batched_kernel(
     MutPtr3 xs,
     const float* __restrict__ saved,
@@ -294,40 +295,43 @@ ctrl_prep_cat_batched_kernel(
     int B) {
     int b = blockIdx.x;
     int s = blockIdx.y;
-    int tid = threadIdx.x;
+    int tid = threadIdx.x; // 0..575 -> 576 * 4 = 2304 EXACT!
     int lane = tid & 31;
-    int warp = tid >> 5;
+    int warp = tid >> 5;   // 0..17
+    int c4 = tid << 2;
 
-    const float* q = cp_queries.p[s];
-    const float* sv = saved + (size_t)b * HIDDEN;
-    const float* pl = prior_last + (size_t)b * HIDDEN;
-    const float* xb = xs.p[s] + (size_t)b * HIDDEN;
+    pdl_wait();
+    pdl_trigger();
 
-    float d0 = 0.0f, d1 = 0.0f, xsq = 0.0f;
-    for (int d = tid; d < HIDDEN; d += 256) {
-        float qv = q[d];
-        d0 = fmaf(qv, sv[d], d0);
-        d1 = fmaf(qv, pl[d], d1);
-        float xv = xb[d];
-        xsq = fmaf(xv, xv, xsq);
-    }
-    d0 = warp_sum(d0); d1 = warp_sum(d1); xsq = warp_sum(xsq);
-    __shared__ float sm0[8], sm1[8], smx[8];
+    const float4 qv = *reinterpret_cast<const float4*>(cp_queries.p[s] + c4);
+    const float4 sv = *reinterpret_cast<const float4*>(saved + (size_t)b * HIDDEN + c4);
+    const float4 pl = *reinterpret_cast<const float4*>(prior_last + (size_t)b * HIDDEN + c4);
+    const uint4 xvu = ld_dep_u4(xs.p[s] + (size_t)b * HIDDEN + c4);
+    const float4 xv = *reinterpret_cast<const float4*>(&xvu);
+
+    float d0 = warp_sum(fmaf(qv.x, sv.x, fmaf(qv.y, sv.y, fmaf(qv.z, sv.z, qv.w * sv.w))));
+    float d1 = warp_sum(fmaf(qv.x, pl.x, fmaf(qv.y, pl.y, fmaf(qv.z, pl.z, qv.w * pl.w))));
+    float xsq = warp_sum(fmaf(xv.x, xv.x, fmaf(xv.y, xv.y, fmaf(xv.z, xv.z, xv.w * xv.w))));
+
+    __shared__ float sm0[18], sm1[18], smx[18];
     if (lane == 0) { sm0[warp] = d0; sm1[warp] = d1; smx[warp] = xsq; }
     __syncthreads();
 
     __shared__ float w0, w1, inv_x;
-    if (tid == 0) {
-        float t0 = 0.0f, t1 = 0.0f, tx = 0.0f;
-        for (int i = 0; i < 8; ++i) { t0 += sm0[i]; t1 += sm1[i]; tx += smx[i]; }
-        float l0 = t0 * INV_SQRT_HIDDEN;
-        float l1 = t1 * INV_SQRT_HIDDEN;
-        float mx = fmaxf(l0, l1);
-        float e0 = expf(l0 - mx), e1 = expf(l1 - mx);
-        float inv = 1.0f / (e0 + e1);
-        w0 = e0 * inv;
-        w1 = e1 * inv;
-        inv_x = rsqrtf(tx / float(HIDDEN) + RMS_EPS);
+    if (warp == 0) {
+        float t0 = warp_sum((lane < 18) ? sm0[lane] : 0.0f);
+        float t1 = warp_sum((lane < 18) ? sm1[lane] : 0.0f);
+        float tx = warp_sum((lane < 18) ? smx[lane] : 0.0f);
+        if (lane == 0) {
+            float l0 = t0 * INV_SQRT_HIDDEN;
+            float l1 = t1 * INV_SQRT_HIDDEN;
+            float mx = fmaxf(l0, l1);
+            float e0 = expf(l0 - mx), e1 = expf(l1 - mx);
+            float inv = 1.0f / (e0 + e1);
+            w0 = e0 * inv;
+            w1 = e1 * inv;
+            inv_x = rsqrtf(tx / float(HIDDEN) + RMS_EPS);
+        }
     }
     __syncthreads();
 
@@ -335,36 +339,34 @@ ctrl_prep_cat_batched_kernel(
     float* msg_b = out_msg + ((size_t)s * B + b) * HIDDEN;
     float* cat_b = out_cat + ((size_t)s * B + b) * (2 * HIDDEN);
 
-    float msq = 0.0f;
-    for (int d = tid; d < HIDDEN; d += 256) {
-        float mv = ww0 * sv[d] + ww1 * pl[d];
-        msg_b[d] = mv;
-        cat_b[d] = xb[d] * ix;
-        msq = fmaf(mv, mv, msq);
-    }
-    msq = warp_sum(msq);
+    float4 mv = make_float4(
+        ww0 * sv.x + ww1 * pl.x,
+        ww0 * sv.y + ww1 * pl.y,
+        ww0 * sv.z + ww1 * pl.z,
+        ww0 * sv.w + ww1 * pl.w);
+    *reinterpret_cast<float4*>(msg_b + c4) = mv;
+    *reinterpret_cast<float4*>(cat_b + c4) = make_float4(xv.x * ix, xv.y * ix, xv.z * ix, xv.w * ix);
+
+    float msq = warp_sum(fmaf(mv.x, mv.x, fmaf(mv.y, mv.y, fmaf(mv.z, mv.z, mv.w * mv.w))));
     if (lane == 0) sm0[warp] = msq;
     __syncthreads();
     __shared__ float inv_m;
-    if (tid == 0) {
-        float tm = 0.0f;
-        for (int i = 0; i < 8; ++i) tm += sm0[i];
-        inv_m = rsqrtf(tm / float(HIDDEN) + RMS_EPS);
+    if (warp == 0) {
+        float tm = warp_sum((lane < 18) ? sm0[lane] : 0.0f);
+        if (lane == 0) inv_m = rsqrtf(tm / float(HIDDEN) + RMS_EPS);
     }
     __syncthreads();
     float im = inv_m;
-    for (int d = tid; d < HIDDEN; d += 256) {
-        cat_b[HIDDEN + d] = msg_b[d] * im;
-    }
+    *reinterpret_cast<float4*>(cat_b + HIDDEN + c4) = make_float4(mv.x * im, mv.y * im, mv.z * im, mv.w * im);
 }
 
-// Kernel 2: Batched down projection d[s, b, 64] = down_w[s] @ cat[s, b, 4608] (templated on B -> 0 spills!)
 template <int B_CONST>
 __global__ void __launch_bounds__(128)
 ctrl_down_batched_kernel(
     CtrlPtr3 cws,
     const float* __restrict__ cat,
-    float* __restrict__ out_d) {
+    float* __restrict__ out_d,
+    uint32_t zero) {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int row = blockIdx.x * 4 + warp;
@@ -374,12 +376,20 @@ ctrl_down_batched_kernel(
     constexpr int K = 2 * HIDDEN;
     const uint4* wr = reinterpret_cast<const uint4*>(cws.down[s] + (size_t)row * K);
 
+    uint4 w_pre[3];
+    #pragma unroll
+    for (int p = 0; p < 3; ++p) w_pre[p] = ld_stream_u4(wr + lane + p * 32);
+    pdl_wait_fenced(zero);
+    pdl_trigger();
+
     float acc[B_CONST];
     #pragma unroll
     for (int b = 0; b < B_CONST; ++b) acc[b] = 0.0f;
 
-    for (int v = lane; v < (K >> 3); v += 32) {
-        uint4 w8 = __ldg(wr + v);
+    #pragma unroll
+    for (int iter = 0; iter < 18; ++iter) {
+        int v = lane + iter * 32;
+        uint4 w8 = (iter < 3) ? w_pre[iter] : ld_stream_u4(wr + v);
         const __nv_bfloat162* wb = reinterpret_cast<const __nv_bfloat162*>(&w8);
         float2 wf0 = __bfloat1622float2(wb[0]);
         float2 wf1 = __bfloat1622float2(wb[1]);
@@ -388,8 +398,10 @@ ctrl_down_batched_kernel(
         int koff = v << 3;
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) {
-            const float4* xf = reinterpret_cast<const float4*>(cat + ((size_t)s * B_CONST + b) * K + koff);
-            float4 x0 = __ldg(xf), x1 = __ldg(xf + 1);
+            uint4 x0u = ld_dep_u4(cat + ((size_t)s * B_CONST + b) * K + koff);
+            uint4 x1u = ld_dep_u4(cat + ((size_t)s * B_CONST + b) * K + koff + 4);
+            const float4 x0 = *reinterpret_cast<const float4*>(&x0u);
+            const float4 x1 = *reinterpret_cast<const float4*>(&x1u);
             acc[b] = fmaf(wf0.x, x0.x, acc[b]); acc[b] = fmaf(wf0.y, x0.y, acc[b]);
             acc[b] = fmaf(wf1.x, x0.z, acc[b]); acc[b] = fmaf(wf1.y, x0.w, acc[b]);
             acc[b] = fmaf(wf2.x, x1.x, acc[b]); acc[b] = fmaf(wf2.y, x1.y, acc[b]);
@@ -403,9 +415,94 @@ ctrl_down_batched_kernel(
     }
 }
 
-// Kernel 3: Batched forget_w @ d + gain_w @ d + (1-tanh(f))*x + tanh(g)*msg!
-// Grid: dim3(36, n_streams), Block: 256 (each block computes 64 output rows: 4 threads per row, 16 elems/thread!)
-// 36 * 3 = 108 blocks at B=1 -> full RTX 5090 bandwidth!
+// Blackwell TF32 Tensor Core MMA Cross-Pass Controller Down Projection (B = 2..8):
+// 100% bit-exact BF16 weights + 10-bit TF32 activations, SPLITK=9 (288 threads), TOTAL_U=4 (9*4*128 = 4608 EXACT!)
+template <int B_CONST>
+__global__ void __launch_bounds__(288)
+ctrl_down_bf16_mma_batched_kernel(
+    CtrlPtr3 cws,
+    const float* __restrict__ cat,
+    float* __restrict__ out_d,
+    uint32_t zero) {
+    constexpr int K = 2 * HIDDEN; // 4608
+    constexpr int SPLITK = 9;
+    constexpr int TOTAL_U = 4;    // 9 * 4 * 128 = 4608 EXACT!
+    __shared__ float cs[SPLITK][16][8];
+
+    const int warp = threadIdx.x >> 5; // 0..8
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int r0 = blockIdx.x * 16;    // 0, 16, 32, 48 (GATE_RANK=64)
+    const int s = blockIdx.y;
+    const int ra = r0 + g, rb = r0 + g + 8;
+    const int k_warp = warp * (128 * TOTAL_U);
+    const bool lx = (g < B_CONST);
+    const float* xg = lx ? (cat + ((size_t)s * B_CONST + g) * K) : nullptr;
+    const __nv_bfloat16* wa = cws.down[s] + (size_t)ra * K;
+    const __nv_bfloat16* wb = cws.down[s] + (size_t)rb * K;
+
+    uint4 aq_cur[4], bq_cur[4];
+    #pragma unroll
+    for (int v = 0; v < 4; ++v) {
+        int off = k_warp + (4 * v + t) * 8;
+        aq_cur[v] = ld_stream_u4(wa + off);
+        bq_cur[v] = ld_stream_u4(wb + off);
+    }
+    pdl_wait_fenced(zero);
+    pdl_trigger();
+
+    float d[4] = {0.f, 0.f, 0.f, 0.f};
+    #pragma unroll 1
+    for (int u = 0; u < TOTAL_U; ++u) {
+        uint4 aq_nxt[4], bq_nxt[4];
+        if (u + 1 < TOTAL_U) {
+            int k_nxt = k_warp + (u + 1) * 128;
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                int off = k_nxt + (4 * v + t) * 8;
+                aq_nxt[v] = ld_stream_u4(wa + off);
+                bq_nxt[v] = ld_stream_u4(wb + off);
+            }
+        }
+        int k_cur = k_warp + u * 128;
+        uint32_t dep = (aq_cur[0].x ^ aq_cur[3].w ^ bq_cur[0].x ^ bq_cur[3].w) & zero;
+        #pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            float4 f0 = make_float4(0.f, 0.f, 0.f, 0.f);
+            float4 f1 = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (lx) {
+                int off = k_cur + (4 * v + t) * 8;
+                uint4 f0u = ld_dep_u4(xg + off);
+                uint4 f1u = ld_dep_u4(xg + off + 4);
+                f0 = *reinterpret_cast<const float4*>(&f0u);
+                f1 = *reinterpret_cast<const float4*>(&f1u);
+            }
+            mma_bf16w_f32x_tf32_8(d, aq_cur[v], bq_cur[v], f0, f1, (v == 0) ? dep : 0u);
+        }
+        if (u + 1 < TOTAL_U) {
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) { aq_cur[v] = aq_nxt[v]; bq_cur[v] = bq_nxt[v]; }
+        }
+    }
+
+    cs[warp][g][2 * t]     = d[0];
+    cs[warp][g][2 * t + 1] = d[1];
+    cs[warp][g + 8][2 * t]     = d[2];
+    cs[warp][g + 8][2 * t + 1] = d[3];
+    __syncthreads();
+
+    if (threadIdx.x < 16 * B_CONST) {
+        int r = threadIdx.x / B_CONST;
+        int m = threadIdx.x % B_CONST;
+        float sum = cs[0][r][m] + cs[1][r][m] + cs[2][r][m]
+                  + cs[3][r][m] + cs[4][r][m] + cs[5][r][m]
+                  + cs[6][r][m] + cs[7][r][m] + cs[8][r][m];
+        out_d[((size_t)s * B_CONST + m) * GATE_RANK + r0 + r] = sum;
+    }
+}
+
+template <int B_CONST>
 __global__ void __launch_bounds__(256)
 ctrl_up_merge_batched_kernel(
     CtrlPtr3 cws,
@@ -413,26 +510,34 @@ ctrl_up_merge_batched_kernel(
     const float* __restrict__ msg, // [n_streams, B, HIDDEN]
     const float* __restrict__ d_in,// [n_streams, B, 64]
     MutPtr3 outs,
-    int B) {
+    uint32_t zero) {
     int s = blockIdx.y;
     int tid = threadIdx.x;
-    __shared__ float s_d[MAX_VERIFY_B][GATE_RANK];
-    for (int b = 0; b < B; ++b) {
-        if (tid < GATE_RANK) s_d[b][tid] = d_in[((size_t)s * B + b) * GATE_RANK + tid];
+    int row_in_blk = tid >> 2; // 0..63
+    int sub = tid & 3;         // 0..3
+    int row = blockIdx.x * 64 + row_in_blk;
+
+    // Pre-issue ALL BF16 forget & gain weight loads BEFORE pdl_wait_fenced(zero)!
+    uint4 f0 = make_uint4(0, 0, 0, 0), f1 = make_uint4(0, 0, 0, 0);
+    uint4 g0 = make_uint4(0, 0, 0, 0), g1 = make_uint4(0, 0, 0, 0);
+    if (row < HIDDEN) {
+        const uint4* wf = reinterpret_cast<const uint4*>(cws.forget[s] + (size_t)row * GATE_RANK);
+        const uint4* wg = reinterpret_cast<const uint4*>(cws.gain[s]   + (size_t)row * GATE_RANK);
+        f0 = ld_stream_u4(wf + sub * 2);     f1 = ld_stream_u4(wf + sub * 2 + 1);
+        g0 = ld_stream_u4(wg + sub * 2);     g1 = ld_stream_u4(wg + sub * 2 + 1);
+    }
+
+    pdl_wait_fenced(zero);
+    pdl_trigger();
+
+    __shared__ float s_d[B_CONST][GATE_RANK];
+    constexpr int D_TOT = B_CONST * GATE_RANK;
+    const float* d_base = d_in + (size_t)s * D_TOT;
+    for (int i = tid; i < D_TOT; i += 256) {
+        s_d[i >> 6][i & 63] = ld_dep_f32(d_base + i);
     }
     __syncthreads();
-
-    // 4 threads per row -> 64 rows per block (256 / 4 = 64)
-    int row_in_blk = tid >> 2; // 0..63
-    int sub = tid & 3;         // 0..3 (each loads 2x uint4 = 16 BF16s = 16 of 64!)
-    int row = blockIdx.x * 64 + row_in_blk;
     if (row >= HIDDEN) return;
-
-    const uint4* wf = reinterpret_cast<const uint4*>(cws.forget[s] + (size_t)row * GATE_RANK);
-    const uint4* wg = reinterpret_cast<const uint4*>(cws.gain[s]   + (size_t)row * GATE_RANK);
-
-    uint4 f0 = __ldg(wf + sub * 2),     f1 = __ldg(wf + sub * 2 + 1);
-    uint4 g0 = __ldg(wg + sub * 2),     g1 = __ldg(wg + sub * 2 + 1);
 
     const __nv_bfloat162* fb0 = reinterpret_cast<const __nv_bfloat162*>(&f0);
     const __nv_bfloat162* fb1 = reinterpret_cast<const __nv_bfloat162*>(&f1);
@@ -449,55 +554,69 @@ ctrl_up_merge_batched_kernel(
     };
 
     int koff = sub * 16;
-    for (int b = 0; b < B; ++b) {
-        const float* db = &s_d[b][koff];
+    #pragma unroll
+    for (int b = 0; b < B_CONST; ++b) {
+        const float4* db4 = reinterpret_cast<const float4*>(&s_d[b][koff]);
         float af = 0.0f, ag = 0.0f;
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            float d0 = db[2 * i], d1 = db[2 * i + 1];
-            af = fmaf(ff[i].x, d0, fmaf(ff[i].y, d1, af));
-            ag = fmaf(gg[i].x, d0, fmaf(gg[i].y, d1, ag));
+        for (int i = 0; i < 4; ++i) {
+            float4 dv = db4[i];
+            af = fmaf(ff[2 * i].x, dv.x, fmaf(ff[2 * i].y, dv.y, fmaf(ff[2 * i + 1].x, dv.z, fmaf(ff[2 * i + 1].y, dv.w, af))));
+            ag = fmaf(gg[2 * i].x, dv.x, fmaf(gg[2 * i].y, dv.y, fmaf(gg[2 * i + 1].x, dv.z, fmaf(gg[2 * i + 1].y, dv.w, ag))));
         }
-        // Reduce across the 4 threads of this row using butterfly XOR 1, 2
         af += __shfl_xor_sync(0xffffffffu, af, 1);
         af += __shfl_xor_sync(0xffffffffu, af, 2);
         ag += __shfl_xor_sync(0xffffffffu, ag, 1);
         ag += __shfl_xor_sync(0xffffffffu, ag, 2);
         if (sub == 0) {
             float xv = xs.p[s][(size_t)b * HIDDEN + row];
-            float mv = msg[((size_t)s * B + b) * HIDDEN + row];
+            float mv = msg[((size_t)s * B_CONST + b) * HIDDEN + row];
             outs.p[s][(size_t)b * HIDDEN + row] = (1.0f - fast_tanh(af)) * xv + fast_tanh(ag) * mv;
         }
     }
 }
 
-// Batched RMSNorm for n_streams (1 or 3) in ONE launch (+ optional half copy!)
-__global__ void __launch_bounds__(256)
+// 576-thread vectorized float4 Batched RMSNorm for n_streams (1 or 3) in ONE launch (+ optional half copy!)
+__global__ void __launch_bounds__(576)
 batched_rmsnorm_kernel(MutPtr3 xs, HalfPtr3 xs_h, BF16Ptr3 norms) {
     int b = blockIdx.x;
     int s = blockIdx.y;
-    int tid = threadIdx.x;
-    float* xb = xs.p[s] + (size_t)b * HIDDEN;
-    __half* xhb = xs_h.p[s] ? (xs_h.p[s] + (size_t)b * HIDDEN) : nullptr;
+    int tid = threadIdx.x; // 0..575 -> 576 * 4 = 2304 EXACT!
+    int lane = tid & 31;
+    int warp = tid >> 5;   // 0..17
+    int c4 = tid << 2;
+    pdl_wait();
+    pdl_trigger();
+
+    float* xb = xs.p[s] + (size_t)b * HIDDEN + c4;
+    __half* xhb = xs_h.p[s] ? (xs_h.p[s] + (size_t)b * HIDDEN + c4) : nullptr;
     const __nv_bfloat16* nw = norms.p[s];
-    float sq = 0.0f;
-    for (int d = tid; d < HIDDEN; d += 256) { float v = xb[d]; sq = fmaf(v, v, sq); }
-    sq = warp_sum(sq);
-    __shared__ float sm[8];
-    if ((tid & 31) == 0) sm[tid >> 5] = sq;
+
+    uint4 xvu = ld_dep_u4(xb);
+    float4 xv = *reinterpret_cast<const float4*>(&xvu);
+    float sq = warp_sum(fmaf(xv.x, xv.x, fmaf(xv.y, xv.y, fmaf(xv.z, xv.z, xv.w * xv.w))));
+    __shared__ float sm[18];
+    if (lane == 0) sm[warp] = sq;
     __syncthreads();
     __shared__ float inv_rms;
-    if (tid == 0) {
-        float tot = 0.0f;
-        for (int i = 0; i < 8; ++i) tot += sm[i];
-        inv_rms = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
+    if (warp == 0) {
+        float tot = warp_sum((lane < 18) ? sm[lane] : 0.0f);
+        if (lane == 0) inv_rms = rsqrtf(tot / float(HIDDEN) + RMS_EPS);
     }
     __syncthreads();
     float ir = inv_rms;
-    for (int d = tid; d < HIDDEN; d += 256) {
-        float v = xb[d] * ir * __bfloat162float(nw[d]);
-        xb[d] = v;
-        if (xhb) xhb[d] = __float2half(v);
+    uint2 nw4 = __ldg(reinterpret_cast<const uint2*>(nw + c4));
+    const __nv_bfloat162* nb = reinterpret_cast<const __nv_bfloat162*>(&nw4);
+    float2 nf0 = __bfloat1622float2(nb[0]), nf1 = __bfloat1622float2(nb[1]);
+    float4 ov = make_float4(xv.x * ir * nf0.x, xv.y * ir * nf0.y, xv.z * ir * nf1.x, xv.w * ir * nf1.y);
+    *reinterpret_cast<float4*>(xb) = ov;
+    if (xhb) {
+        __half2 h0 = __floats2half2_rn(ov.x, ov.y);
+        __half2 h1 = __floats2half2_rn(ov.z, ov.w);
+        uint2 hu;
+        hu.x = *reinterpret_cast<uint32_t*>(&h0);
+        hu.y = *reinterpret_cast<uint32_t*>(&h1);
+        *reinterpret_cast<uint2*>(xhb) = hu;
     }
 }
 
@@ -1202,18 +1321,27 @@ route_logits_parallel_kernel(
     const float* __restrict__ m,               // [B, HIDDEN]
     const __nv_bfloat16* __restrict__ router_w,// [128, HIDDEN]
     float* __restrict__ out_logits,            // [B, 128]
-    float* __restrict__ moe_down_zero) {       // optional [B, HIDDEN] zeroed in parallel!
+    float* __restrict__ moe_down_zero,         // optional [B, HIDDEN] zeroed in parallel!
+    uint32_t zero) {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int e = blockIdx.x * 2 + warp;
     if (e < NUM_EXPERTS) {
         const uint4* wr = reinterpret_cast<const uint4*>(router_w + (size_t)e * HIDDEN);
+        uint4 w_pre[3];
+        #pragma unroll
+        for (int p = 0; p < 3; ++p) w_pre[p] = ld_stream_u4(wr + lane + p * 32);
+        pdl_wait_fenced(zero);
+        pdl_trigger();
+
         float acc[B_CONST];
         #pragma unroll
         for (int b = 0; b < B_CONST; ++b) acc[b] = 0.0f;
 
-        for (int v = lane; v < (HIDDEN >> 3); v += 32) {
-            uint4 w8 = __ldg(wr + v);
+        #pragma unroll
+        for (int iter = 0; iter < 9; ++iter) {
+            int v = lane + iter * 32;
+            uint4 w8 = (iter < 3) ? w_pre[iter] : ld_stream_u4(wr + v);
             const __nv_bfloat162* wb = reinterpret_cast<const __nv_bfloat162*>(&w8);
             float2 wf0 = __bfloat1622float2(wb[0]);
             float2 wf1 = __bfloat1622float2(wb[1]);
@@ -1222,8 +1350,10 @@ route_logits_parallel_kernel(
             int koff = v << 3;
             #pragma unroll
             for (int b = 0; b < B_CONST; ++b) {
-                const float4* xf = reinterpret_cast<const float4*>(m + (size_t)b * HIDDEN + koff);
-                float4 x0 = __ldg(xf), x1 = __ldg(xf + 1);
+                uint4 x0u = ld_dep_u4(m + (size_t)b * HIDDEN + koff);
+                uint4 x1u = ld_dep_u4(m + (size_t)b * HIDDEN + koff + 4);
+                const float4 x0 = *reinterpret_cast<const float4*>(&x0u);
+                const float4 x1 = *reinterpret_cast<const float4*>(&x1u);
                 acc[b] = fmaf(wf0.x, x0.x, acc[b]); acc[b] = fmaf(wf0.y, x0.y, acc[b]);
                 acc[b] = fmaf(wf1.x, x0.z, acc[b]); acc[b] = fmaf(wf1.y, x0.w, acc[b]);
                 acc[b] = fmaf(wf2.x, x1.x, acc[b]); acc[b] = fmaf(wf2.y, x1.y, acc[b]);
@@ -1244,6 +1374,91 @@ route_logits_parallel_kernel(
                 md4[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
         }
+    }
+}
+
+// Blackwell TF32 Tensor Core MMA BF16 MoE Router (B = 2..8):
+// 8 M-tiles x SPLITK=9 (288 threads), TOTAL_U=2 (9 * 2 * 128 = 2304 EXACT!) -> 100% deterministic, zero atomics!
+template <int B_CONST>
+__global__ void __launch_bounds__(288)
+route_logits_bf16_mma_kernel(
+    const float* __restrict__ m,               // [B, HIDDEN]
+    const __nv_bfloat16* __restrict__ router_w,// [128, HIDDEN]
+    float* __restrict__ out_logits,            // [B, 128]
+    uint32_t zero) {
+    constexpr int SPLITK = 9;
+    constexpr int TOTAL_U = 2; // 9 * 2 * 128 = 2304 EXACT!
+    __shared__ float cs[SPLITK][16][8];
+
+    const int warp = threadIdx.x >> 5; // 0..8
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int r0 = blockIdx.x * 16;    // 0, 16, ..., 112 (NUM_EXPERTS=128)
+    const int ra = r0 + g, rb = r0 + g + 8;
+    const int k_warp = warp * (128 * TOTAL_U);
+    const bool lx = (g < B_CONST);
+    const float* xg = lx ? (m + (size_t)g * HIDDEN) : nullptr;
+    const __nv_bfloat16* wa = router_w + (size_t)ra * HIDDEN;
+    const __nv_bfloat16* wb = router_w + (size_t)rb * HIDDEN;
+
+    uint4 aq_cur[4], bq_cur[4];
+    #pragma unroll
+    for (int v = 0; v < 4; ++v) {
+        int off = k_warp + (4 * v + t) * 8;
+        aq_cur[v] = ld_stream_u4(wa + off);
+        bq_cur[v] = ld_stream_u4(wb + off);
+    }
+    pdl_wait_fenced(zero);
+    pdl_trigger();
+
+    float d[4] = {0.f, 0.f, 0.f, 0.f};
+    #pragma unroll
+    for (int u = 0; u < TOTAL_U; ++u) {
+        uint4 aq_nxt[4], bq_nxt[4];
+        if (u + 1 < TOTAL_U) {
+            int k_nxt = k_warp + (u + 1) * 128;
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                int off = k_nxt + (4 * v + t) * 8;
+                aq_nxt[v] = ld_stream_u4(wa + off);
+                bq_nxt[v] = ld_stream_u4(wb + off);
+            }
+        }
+        int k_cur = k_warp + u * 128;
+        uint32_t dep = (aq_cur[0].x ^ aq_cur[3].w ^ bq_cur[0].x ^ bq_cur[3].w) & zero;
+        #pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            float4 f0 = make_float4(0.f, 0.f, 0.f, 0.f);
+            float4 f1 = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (lx) {
+                int off = k_cur + (4 * v + t) * 8;
+                uint4 f0u = ld_dep_u4(xg + off);
+                uint4 f1u = ld_dep_u4(xg + off + 4);
+                f0 = *reinterpret_cast<const float4*>(&f0u);
+                f1 = *reinterpret_cast<const float4*>(&f1u);
+            }
+            mma_bf16w_f32x_tf32_8(d, aq_cur[v], bq_cur[v], f0, f1, (v == 0) ? dep : 0u);
+        }
+        if (u + 1 < TOTAL_U) {
+            #pragma unroll
+            for (int v = 0; v < 4; ++v) { aq_cur[v] = aq_nxt[v]; bq_cur[v] = bq_nxt[v]; }
+        }
+    }
+
+    cs[warp][g][2 * t]     = d[0];
+    cs[warp][g][2 * t + 1] = d[1];
+    cs[warp][g + 8][2 * t]     = d[2];
+    cs[warp][g + 8][2 * t + 1] = d[3];
+    __syncthreads();
+
+    if (threadIdx.x < 16 * B_CONST) {
+        int r = threadIdx.x / B_CONST;
+        int bm = threadIdx.x % B_CONST;
+        float sum = cs[0][r][bm] + cs[1][r][bm] + cs[2][r][bm]
+                  + cs[3][r][bm] + cs[4][r][bm] + cs[5][r][bm]
+                  + cs[6][r][bm] + cs[7][r][bm] + cs[8][r][bm];
+        out_logits[bm * NUM_EXPERTS + r0 + r] = sum;
     }
 }
 
@@ -2522,21 +2737,43 @@ void launch_controller_merge_batched(
         cp.gain[s] = cws[idx]->gain_w;
         np.p[s] = post_norms[idx];
     }
-    ctrl_prep_cat_batched_kernel<<<dim3(B, n_streams), 256, 0, stream>>>(
+    launch_pdl(ctrl_prep_cat_batched_kernel, dim3(B, n_streams), 576, stream,
         xp, saved, prior_last, qp, scratch_msg, scratch_cat, B);
     switch (B) {
-        case 1: ctrl_down_batched_kernel<1><<<dim3(16, n_streams), 128, 0, stream>>>(cp, scratch_cat, scratch_d); break;
-        case 2: ctrl_down_batched_kernel<2><<<dim3(16, n_streams), 128, 0, stream>>>(cp, scratch_cat, scratch_d); break;
-        case 3: ctrl_down_batched_kernel<3><<<dim3(16, n_streams), 128, 0, stream>>>(cp, scratch_cat, scratch_d); break;
-        case 4: ctrl_down_batched_kernel<4><<<dim3(16, n_streams), 128, 0, stream>>>(cp, scratch_cat, scratch_d); break;
-        case 5: ctrl_down_batched_kernel<5><<<dim3(16, n_streams), 128, 0, stream>>>(cp, scratch_cat, scratch_d); break;
-        case 6: ctrl_down_batched_kernel<6><<<dim3(16, n_streams), 128, 0, stream>>>(cp, scratch_cat, scratch_d); break;
-        case 7: ctrl_down_batched_kernel<7><<<dim3(16, n_streams), 128, 0, stream>>>(cp, scratch_cat, scratch_d); break;
-        case 8: ctrl_down_batched_kernel<8><<<dim3(16, n_streams), 128, 0, stream>>>(cp, scratch_cat, scratch_d); break;
+        case 1:
+            launch_pdl(ctrl_down_batched_kernel<1>, dim3(16, n_streams), 128, stream, cp, scratch_cat, scratch_d, 0u);
+            launch_pdl(ctrl_up_merge_batched_kernel<1>, dim3(36, n_streams), 256, stream, cp, xp, scratch_msg, scratch_d, op, 0u);
+            break;
+        case 2:
+            launch_pdl(ctrl_down_bf16_mma_batched_kernel<2>, dim3(4, n_streams), 288, stream, cp, scratch_cat, scratch_d, 0u);
+            launch_pdl(ctrl_up_merge_batched_kernel<2>, dim3(36, n_streams), 256, stream, cp, xp, scratch_msg, scratch_d, op, 0u);
+            break;
+        case 3:
+            launch_pdl(ctrl_down_bf16_mma_batched_kernel<3>, dim3(4, n_streams), 288, stream, cp, scratch_cat, scratch_d, 0u);
+            launch_pdl(ctrl_up_merge_batched_kernel<3>, dim3(36, n_streams), 256, stream, cp, xp, scratch_msg, scratch_d, op, 0u);
+            break;
+        case 4:
+            launch_pdl(ctrl_down_bf16_mma_batched_kernel<4>, dim3(4, n_streams), 288, stream, cp, scratch_cat, scratch_d, 0u);
+            launch_pdl(ctrl_up_merge_batched_kernel<4>, dim3(36, n_streams), 256, stream, cp, xp, scratch_msg, scratch_d, op, 0u);
+            break;
+        case 5:
+            launch_pdl(ctrl_down_bf16_mma_batched_kernel<5>, dim3(4, n_streams), 288, stream, cp, scratch_cat, scratch_d, 0u);
+            launch_pdl(ctrl_up_merge_batched_kernel<5>, dim3(36, n_streams), 256, stream, cp, xp, scratch_msg, scratch_d, op, 0u);
+            break;
+        case 6:
+            launch_pdl(ctrl_down_bf16_mma_batched_kernel<6>, dim3(4, n_streams), 288, stream, cp, scratch_cat, scratch_d, 0u);
+            launch_pdl(ctrl_up_merge_batched_kernel<6>, dim3(36, n_streams), 256, stream, cp, xp, scratch_msg, scratch_d, op, 0u);
+            break;
+        case 7:
+            launch_pdl(ctrl_down_bf16_mma_batched_kernel<7>, dim3(4, n_streams), 288, stream, cp, scratch_cat, scratch_d, 0u);
+            launch_pdl(ctrl_up_merge_batched_kernel<7>, dim3(36, n_streams), 256, stream, cp, xp, scratch_msg, scratch_d, op, 0u);
+            break;
+        case 8:
+            launch_pdl(ctrl_down_bf16_mma_batched_kernel<8>, dim3(4, n_streams), 288, stream, cp, scratch_cat, scratch_d, 0u);
+            launch_pdl(ctrl_up_merge_batched_kernel<8>, dim3(36, n_streams), 256, stream, cp, xp, scratch_msg, scratch_d, op, 0u);
+            break;
     }
-    ctrl_up_merge_batched_kernel<<<dim3(36, n_streams), 256, 0, stream>>>(
-        cp, xp, scratch_msg, scratch_d, op, B);
-    batched_rmsnorm_kernel<<<dim3(B, n_streams), 256, 0, stream>>>(op, ohp, np);
+    launch_pdl(batched_rmsnorm_kernel, dim3(B, n_streams), 576, stream, op, ohp, np);
 }
 
 void launch_static_sconv(
@@ -2624,7 +2861,13 @@ static void dispatch_route_bf16(
     const float* m, const __nv_bfloat16* router_w, const float* router_bias,
     float* scratch_logits, int32_t* out_ids, float* out_weights,
     ExpertGroups* groups, float* moe_down_zero, cudaStream_t stream) {
-    route_logits_parallel_kernel<B_CONST><<<64, 64, 0, stream>>>(m, router_w, scratch_logits, moe_down_zero);
+    if constexpr (B_CONST == 1) {
+        launch_pdl(route_logits_parallel_kernel<1>, dim3(64), 64, stream,
+            m, router_w, scratch_logits, moe_down_zero, 0u);
+    } else {
+        launch_pdl(route_logits_bf16_mma_kernel<B_CONST>, dim3(8), 288, stream,
+            m, router_w, scratch_logits, 0u);
+    }
     launch_pdl(route_select_and_group_kernel<B_CONST>, dim3(1), B_CONST * 32, stream,
         scratch_logits, router_bias, out_ids, out_weights, groups, 0u);
 }
@@ -2722,7 +2965,7 @@ void launch_controller_nvfp4_batched(
         case 7: dispatch_ctrl_nvfp4_b<7>(cp, xp, op, scratch_msg, scratch_cat_h, scratch_d_h, n_streams, stream); break;
         case 8: dispatch_ctrl_nvfp4_b<8>(cp, xp, op, scratch_msg, scratch_cat_h, scratch_d_h, n_streams, stream); break;
     }
-    batched_rmsnorm_kernel<<<dim3(B, n_streams), 256, 0, stream>>>(op, ohp, np);
+    batched_rmsnorm_kernel<<<dim3(B, n_streams), 576, 0, stream>>>(op, ohp, np);
 }
 
 void launch_controller_mega_nvfp4(

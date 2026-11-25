@@ -11,6 +11,12 @@ const weights_mod = @import("weights.zig");
 
 pub const TokenCallbackFn = *const fn (context: *anyopaque, token_id: i32) bool;
 
+pub const ImageSpan = struct {
+    start_pos: u32,
+    count: u32,
+    embeds: [*]const f32,
+};
+
 pub const SampleParams = struct {
     temperature: f32 = 0.0,
     top_p: f32 = 0.95,
@@ -36,9 +42,9 @@ pub const GenerateStats = struct {
 /// On a >=16-token exact suffix match, proposes the next 7 tokens directly to the B=8 verify graph,
 /// bypassing the DSpark neural pass completely (~5 ns CPU lookup vs ~400 us GPU draft).
 const PromptLookupIndex = struct {
-    const hist_cap: usize = 8_192;
+    const hist_cap: usize = 32_768;
     const hist_mask: usize = hist_cap - 1;
-    const table_cap: usize = 16_384;
+    const table_cap: usize = 65_536;
     const table_mask: usize = table_cap - 1;
     const min_match_len: u32 = 16;
 
@@ -72,6 +78,7 @@ const PromptLookupIndex = struct {
     }
 
     fn push(self: *PromptLookupIndex, tok: i32) void {
+        if (tok < 0) return;
         const idx = self.count;
         self.hist[idx & hist_mask] = tok;
         self.count = idx + 1;
@@ -178,6 +185,11 @@ pub const Engine = struct {
     // Multi-checkpoint host-RAM prefix KV cache (zero extra VRAM!)
     prefix_cache: PrefixCache = .{},
     prompt_lookup: PromptLookupIndex = .{},
+
+    // Optional per-request vision embedding spans (set by caller during prefill)
+    active_images: []const ImageSpan = &.{},
+    active_prompt_offset: u32 = std.math.maxInt(u32),
+    h_clamped_tokens: [prefill_batch_max]i32 = @splat(0),
 
     // Per-visit KV caches and sconv rings
     kv_cap: [constants.visit_count]i32 = @splat(0),
@@ -1130,6 +1142,7 @@ pub const Engine = struct {
                         self.d_draft_probs,
                         self.d_draft_q_sel,
                         self.d_draft_is_delta,
+                        0.0,
                         self.stream,
                     );
                     cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, @intCast(num_drafts), self.stream);
@@ -1219,6 +1232,50 @@ pub const Engine = struct {
         return stats;
     }
 
+    fn has_image_overlap(self: *const Engine, start_i: u32, count: u32) bool {
+        if (self.active_images.len == 0) return false;
+        const end_i: u32 = start_i + count;
+        for (self.active_images) |span| {
+            const span_end: u32 = span.start_pos + span.count;
+            if (span.start_pos < end_i and span_end > start_i) return true;
+        }
+        return false;
+    }
+
+    fn upload_clamped_tokens(self: *Engine, dst_dev: [*]i32, src: []const i32) void {
+        if (self.active_images.len == 0) {
+            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(dst_dev), @ptrCast(src.ptr), src.len * @sizeOf(i32), self.stream));
+            return;
+        }
+        tiger.assert(src.len <= prefill_batch_max);
+        var k: usize = 0;
+        while (k < src.len) : (k += 1) {
+            self.h_clamped_tokens[k] = if (src[k] < 0) 0 else src[k];
+        }
+        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(dst_dev), @ptrCast(&self.h_clamped_tokens), src.len * @sizeOf(i32), self.stream));
+    }
+
+    fn overwrite_image_hidden(self: *Engine, start_i: u32, count: u32, dst_hidden: [*]f32) void {
+        if (self.active_images.len == 0) return;
+        const end_i: u32 = start_i + count;
+        for (self.active_images) |span| {
+            const span_end: u32 = span.start_pos + span.count;
+            const lo: u32 = @max(start_i, span.start_pos);
+            const hi: u32 = @min(end_i, span_end);
+            if (lo < hi) {
+                const dst_row: usize = lo - start_i;
+                const src_row: usize = lo - span.start_pos;
+                const n_rows: usize = hi - lo;
+                tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
+                    @ptrCast(dst_hidden + dst_row * constants.hidden_dim),
+                    @ptrCast(span.embeds + src_row * constants.hidden_dim),
+                    n_rows * constants.hidden_dim * @sizeOf(f32),
+                    self.stream,
+                ));
+            }
+        }
+    }
+
     fn prefill_range(self: *Engine, prompt: []const i32, start_i: u32, end_i: u32, use_mtp: bool, compute_last_lm: bool) u32 {
         tiger.assert(end_i >= start_i);
         var i: u32 = start_i;
@@ -1234,6 +1291,7 @@ pub const Engine = struct {
             const pgraph = self.prefill_b8_graph_exec[if (use_mtp) 1 else 0].?;
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
             while (i + constants.mtp_block_size_max <= end_i and (!compute_last_lm or i + constants.mtp_block_size_max < end_i)) {
+                if (self.has_image_overlap(i, constants.mtp_block_size_max)) break;
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
                     @ptrCast(self.d_tokens),
                     @ptrCast(prompt[i..].ptr),
@@ -1248,9 +1306,11 @@ pub const Engine = struct {
         while (i < end_i) {
             const batch: u32 = @intCast(tiger.min_u64(constants.mtp_block_size_max, end_i - i));
             const is_last: bool = compute_last_lm and (i + batch == end_i);
-            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
+            self.upload_clamped_tokens(self.d_tokens, prompt[i .. i + batch]);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            self.active_prompt_offset = i;
             self.record_target_forward(@intCast(batch), use_mtp, is_last, false);
+            self.active_prompt_offset = std.math.maxInt(u32);
             self.current_position += @intCast(batch);
             i += batch;
         }
@@ -1272,6 +1332,7 @@ pub const Engine = struct {
             const pgraph = self.prefill_b8_graph_exec[if (use_mtp) 1 else 0].?;
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
             while (i + constants.mtp_block_size_max < prompt_len) {
+                if (self.has_image_overlap(i, constants.mtp_block_size_max)) break;
                 tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(
                     @ptrCast(self.d_tokens),
                     @ptrCast(prompt[i..].ptr),
@@ -1287,9 +1348,11 @@ pub const Engine = struct {
         while (i < prompt_len) {
             const batch: u32 = @intCast(tiger.min_u64(constants.mtp_block_size_max, prompt_len - i));
             const is_last: bool = (i + batch == prompt_len);
-            tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_tokens), @ptrCast(prompt[i..].ptr), batch * @sizeOf(i32), self.stream));
+            self.upload_clamped_tokens(self.d_tokens, prompt[i .. i + batch]);
             tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.d_pos), @ptrCast(&self.current_position), @sizeOf(i32), self.stream));
+            self.active_prompt_offset = i;
             self.record_target_forward(@intCast(batch), use_mtp, is_last, false);
+            self.active_prompt_offset = std.math.maxInt(u32);
             self.current_position += @intCast(batch);
             i += batch;
             last_batch = batch;
@@ -1313,9 +1376,10 @@ pub const Engine = struct {
             h_pos_vec[s] = self.current_position + @as(i32, @intCast(s * 8));
         }
         tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.p_pos_vec), @ptrCast(&h_pos_vec), n_sub * @sizeOf(i32), self.stream));
-        tiger.assert_cuda(cuda.squid_cuda_memcpy_h2d_async(@ptrCast(self.p_tokens), @ptrCast(prompt[start_i..].ptr), b_usize * @sizeOf(i32), self.stream));
+        self.upload_clamped_tokens(self.p_tokens, prompt[start_i .. start_i + chunk_len]);
 
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.p_tokens, self.p_hidden, b_i32, self.stream);
+        self.overwrite_image_hidden(start_i, chunk_len, self.p_hidden);
 
         var block_count: i32 = 0;
         var has_prior: bool = false;
@@ -1490,9 +1554,20 @@ pub const Engine = struct {
             const in_qh = self.p_attn_in_h[0];
             const in_kh = if (distinct_inputs) self.p_attn_in_h[1] else self.p_attn_in_h[0];
             const in_vh = if (distinct_inputs) self.p_attn_in_h[2] else self.p_attn_in_h[0];
-            cuda.squid_launch_prefill_gemm_h(&lw.w_qrgs, in_qh, self.p_qrgs, self.p_w_f16, b_i32, self.stream);
-            cuda.squid_launch_prefill_gemm_h(&lw.w_k, in_kh, self.p_k_proj, self.p_w_f16, b_i32, self.stream);
-            cuda.squid_launch_prefill_gemm_h(&lw.w_v, in_vh, self.p_v_proj, self.p_w_f16, b_i32, self.stream);
+            cuda.squid_launch_prefill_qkv_h(
+                &lw.w_qrgs,
+                &lw.w_k,
+                &lw.w_v,
+                in_qh,
+                in_kh,
+                in_vh,
+                self.p_qrgs,
+                self.p_k_proj,
+                self.p_v_proj,
+                self.p_w_f16,
+                b_i32,
+                self.stream,
+            );
             if (prof_on) {
                 tiger.assert_cuda(cuda.squid_cuda_stream_sync(self.stream));
                 const now = tiger.clock_monotonic_ns();
@@ -2053,6 +2128,9 @@ pub const Engine = struct {
         const moe_slotted: u8 = 0;
 
         cuda.squid_launch_embed_norm(w.embed.?, w.embed_norm.?, self.d_tokens, self.hidden, batch_size, self.stream);
+        if (self.active_prompt_offset != std.math.maxInt(u32) and self.active_images.len > 0) {
+            self.overwrite_image_hidden(self.active_prompt_offset, @intCast(batch_size), self.hidden);
+        }
 
         var block_count: i32 = 0;
         var has_prior: bool = false;
@@ -2249,9 +2327,7 @@ pub const Engine = struct {
             if (lw.w_qrgs.kind != @intFromEnum(constants.WeightKind.bf16)) {
                 cuda.squid_launch_qkvrg_fused(&lw.w_qrgs, &lw.w_k, &lw.w_v, in_qh, in_kh, in_vh, self.qrgs, self.k_proj, self.v_proj, batch_size, self.stream);
             } else {
-                cuda.squid_launch_linear(&lw.w_qrgs, in_q, self.qrgs, batch_size, 0, self.stream);
-                cuda.squid_launch_linear(&lw.w_k, in_k, self.k_proj, batch_size, 0, self.stream);
-                cuda.squid_launch_linear(&lw.w_v, in_v, self.v_proj, batch_size, 0, self.stream);
+                cuda.squid_launch_qkvrg_fused_f32(&lw.w_qrgs, &lw.w_k, &lw.w_v, in_q, in_k, in_v, self.qrgs, self.k_proj, self.v_proj, batch_size, self.stream);
             }
 
             if (v.is_global) {
@@ -2560,6 +2636,7 @@ pub const Engine = struct {
             self.d_draft_probs,
             self.d_draft_q_sel,
             self.d_draft_is_delta,
+            0.0,
             self.stream,
         );
         cuda.squid_launch_assemble_verify_tokens(self.d_anchor, self.d_drafts, self.d_tokens, @intCast(num_drafts), self.stream);
@@ -2575,7 +2652,11 @@ pub const Engine = struct {
         const ds_ks_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_k_scale[0], self.ds_k_scale[1], self.ds_k_scale[2] };
         const ds_vs_const: [constants.mtp_layer_count]?*const anyopaque = .{ self.ds_v_scale[0], self.ds_v_scale[1], self.ds_v_scale[2] };
 
-        if (self.draft_graph_exec == null) {
+        if (self.draft_graph_exec == null or self.adaptive_graph_threshold != self.spec_threshold) {
+            if (self.draft_graph_exec) |old_draft| {
+                tiger.assert_cuda(cuda.squid_cuda_graph_destroy(old_draft));
+                self.draft_graph_exec = null;
+            }
             tiger.assert_cuda(cuda.squid_cuda_graph_begin(self.stream));
             cuda.squid_launch_dspark_draft(
                 w.embed.?,
@@ -2599,6 +2680,7 @@ pub const Engine = struct {
                 self.d_draft_probs,
                 self.d_draft_q_sel,
                 self.d_draft_is_delta,
+                self.spec_threshold,
                 self.stream,
             );
             tiger.assert_cuda(cuda.squid_cuda_graph_end_instantiate(self.stream, &self.draft_graph_exec));

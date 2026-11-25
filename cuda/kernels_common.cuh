@@ -244,6 +244,30 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
+__device__ __forceinline__ float warp_min(float v) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        v = fminf(v, __shfl_xor_sync(0xffffffffu, v, off));
+    }
+    return v;
+}
+
+// Prescaled exact FP16 power-of-two UE8M0 decode (scaled by 2^12 = 4096.0f):
+// Prevents FP16 subnormal underflow/stalls on Inkling-2-Mini MXFP8 scales (100% in [113..118], 2^-14..2^-9):
+//   2^(s - 127) * 2^12 = 2^(s - 115) -> FP16 biased exp = (s - 115) + 15 = s - 100.
+//   Min non-zero |e4m3 * scale| = 2^-9 * 2^-2 = 2^-11 (100% normal FP16, bit-exact, zero denormals!)
+//   Max |e4m3 * scale| = 448 * 8 = 3584 (<< 65504, zero overflow).
+// Rescale FP32 MMA accumulator by MXFP8_FP16_UNSCALE in the epilogue!
+constexpr float MXFP8_FP16_UNSCALE = 1.0f / 4096.0f;
+__device__ __forceinline__ __half2 cvt_ue8m0_to_half2_prescaled(uint8_t s) {
+    if (s >= 101 && s <= 130) {
+        uint16_t hbits = static_cast<uint16_t>((static_cast<uint32_t>(s) - 100u) << 10);
+        uint32_t pair = static_cast<uint32_t>(hbits) | (static_cast<uint32_t>(hbits) << 16);
+        return *reinterpret_cast<const __half2*>(&pair);
+    }
+    return __float2half2_rn(cvt_ue8m0_to_float(s) * 4096.0f);
+}
+
 __device__ __forceinline__ float half2_dot_f32(__half2 a, __half2 b) {
     float2 fa = __half22float2(a);
     float2 fb = __half22float2(b);
@@ -291,6 +315,50 @@ __device__ __forceinline__ void mma_m16n8k16_f32_f16(
           "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 
+// Round FP32 -> TF32 (8-bit exp, 10-bit mantissa) using hardware cvt.rna.tf32.f32
+__device__ __forceinline__ uint32_t cvt_f32_to_tf32(float x) {
+    uint32_t r;
+    asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(r) : "f"(x));
+    return r;
+}
+
+// Hardware TF32 Tensor Core MMA: D[16,8] = A[16,8] * B[8,8] + C[16,8] (FP32 accumulate)
+// Every BF16 weight (7-bit mantissa) is 100% bit-exact in TF32 while activations keep 10-bit mantissa!
+__device__ __forceinline__ void mma_m16n8k8_f32_tf32(
+    float& d0, float& d1, float& d2, float& d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    float c0, float c1, float c2, float c3) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0, %1, %2, %3}, "
+        "{%4, %5, %6, %7}, "
+        "{%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+          "r"(b0), "r"(b1),
+          "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+}
+
+// Helper: 100% bit-exact BF16 weight uint4 x FP32 activation (float4, float4) -> 4x TF32 MMA (K=32)!
+__device__ __forceinline__ void mma_bf16w_f32x_tf32_8(
+    float (&d)[4], uint4 aq, uint4 bq, float4 f0, float4 f1, uint32_t dep) {
+    auto step2 = [&](uint32_t aw, uint32_t bw, float x0, float x1, uint32_t dmask) {
+        uint32_t a0 = (aw & 0xFFFFu) << 16;
+        uint32_t a1 = (bw & 0xFFFFu) << 16;
+        uint32_t a2 = (aw & 0xFFFF0000u);
+        uint32_t a3 = (bw & 0xFFFF0000u);
+        uint32_t b0 = cvt_f32_to_tf32(x0) ^ dmask;
+        uint32_t b1 = cvt_f32_to_tf32(x1);
+        mma_m16n8k8_f32_tf32(d[0], d[1], d[2], d[3], a0, a1, a2, a3, b0, b1, d[0], d[1], d[2], d[3]);
+    };
+    step2(aq.x, bq.x, f0.x, f0.y, dep);
+    step2(aq.y, bq.y, f0.z, f0.w, 0u);
+    step2(aq.z, bq.z, f1.x, f1.y, 0u);
+    step2(aq.w, bq.w, f1.z, f1.w, 0u);
+}
+
 __device__ __forceinline__ void ldmatrix_x4(
     uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* smem_ptr) {
     uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
@@ -331,16 +399,17 @@ __device__ __forceinline__ void store_kv_head_128(
         if (tid == 0) scales[(size_t)slot * NUM_KV_HEADS + h] = __float2half(sc);
         static_cast<uint8_t*>(cache)[(size_t)slot * KV_DIM + h * HEAD_DIM + tid] = float_to_e4m3(val / sc);
     } else {
-        int warp = tid >> 5;
+        // Group-32 Asymmetric Q4 (0..15, 1 warp = 1 group -> ZERO __syncthreads(), ZERO SMEM!)
+        int g = tid >> 5; // 0..3 (dims 0..31, 32..63, 64..95, 96..127)
         int lane = tid & 31;
-        float wm = warp_max(fabsf(val));
-        if (lane == 0) sm[warp] = wm;
-        __syncthreads();
-        int g = tid >> 6; // 0 (dims 0..63) or 1 (dims 64..127)
-        float gmax = fmaxf(sm[g * 2], sm[g * 2 + 1]);
-        float sc = fmaxf(gmax / 7.0f, 1e-7f);
-        if ((tid & 63) == 0) scales[(size_t)slot * KV_Q4_SCALES_PER_TOK + h * 2 + g] = __float2half(sc);
-        int q = max(-7, min(7, __float2int_rn(val / sc))) + 7; // 0..14
+        float wmin = warp_min(val);
+        float wmax = warp_max(val);
+        float sc = fmaxf((wmax - wmin) / 15.0f, 1e-7f);
+        if (lane == 0) {
+            reinterpret_cast<__half2*>(scales)[(size_t)slot * (NUM_KV_HEADS * KV_Q4_GROUPS_PER_HEAD) + h * KV_Q4_GROUPS_PER_HEAD + g] =
+                __floats2half2_rn(sc, wmin);
+        }
+        int q = max(0, min(15, __float2int_rn((val - wmin) / sc))); // 0..15 (all 16 levels!)
         int q_odd = __shfl_xor_sync(0xffffffffu, q, 1);
         if ((tid & 1) == 0) {
             static_cast<uint8_t*>(cache)[(size_t)slot * (KV_DIM >> 1) + h * 64 + (tid >> 1)] =
@@ -371,9 +440,11 @@ __device__ __forceinline__ void load_kv_4elems(
     } else {
         uint16_t raw = __ldg(reinterpret_cast<const uint16_t*>(
             static_cast<const uint8_t*>(cache) + (size_t)slot * (KV_DIM >> 1) + kvh * 64 + (d_off >> 1)));
-        float sc = __half2float(__ldg(scales + (size_t)slot * KV_Q4_SCALES_PER_TOK + kvh * 2 + (d_off >> 6)));
-        out0 = make_float2((float(int(raw & 0xFu) - 7)) * sc, (float(int((raw >> 4) & 0xFu) - 7)) * sc);
-        out1 = make_float2((float(int((raw >> 8) & 0xFu) - 7)) * sc, (float(int((raw >> 12) & 0xFu) - 7)) * sc);
+        uint32_t sm_u32 = __ldg(reinterpret_cast<const uint32_t*>(scales)
+            + (size_t)slot * (NUM_KV_HEADS * KV_Q4_GROUPS_PER_HEAD) + kvh * KV_Q4_GROUPS_PER_HEAD + (d_off >> 5));
+        float2 sm = __half22float2(*reinterpret_cast<const __half2*>(&sm_u32));
+        out0 = make_float2(fmaf(float(raw & 0xFu), sm.x, sm.y), fmaf(float((raw >> 4) & 0xFu), sm.x, sm.y));
+        out1 = make_float2(fmaf(float((raw >> 8) & 0xFu), sm.x, sm.y), fmaf(float((raw >> 12) & 0xFu), sm.x, sm.y));
     }
 }
 
@@ -404,15 +475,18 @@ __device__ __forceinline__ uint4 load_kv_8elems_h2x4(
     } else {
         uint32_t raw = __ldg(reinterpret_cast<const uint32_t*>(
             static_cast<const uint8_t*>(cache) + (size_t)slot * (KV_DIM >> 1) + kvh * 64) + sub);
-        __half sc = __ldg(scales + (size_t)slot * KV_Q4_SCALES_PER_TOK + kvh * 2 + (sub >> 3));
-        __half2 hsc = __half2half2(sc);
-        __half2 h1031 = __float2half2_rn(1031.0f);
-        // Fast exact FP16 magic-bias nibble unpack: (0x6400 | n) = 1024+n -> sub 1031 = n-7 -> mul sc!
+        uint32_t sm_u32 = __ldg(reinterpret_cast<const uint32_t*>(scales)
+            + (size_t)slot * (NUM_KV_HEADS * KV_Q4_GROUPS_PER_HEAD) + kvh * KV_Q4_GROUPS_PER_HEAD + (sub >> 2));
+        __half2 sm = *reinterpret_cast<const __half2*>(&sm_u32);
+        __half2 hsc = __low2half2(sm);
+        __half2 hmin = __high2half2(sm);
+        __half2 h1024 = __float2half2_rn(1024.0f);
+        // Fast exact FP16 magic-bias asymmetric unpack: (0x6400 | n) = 1024+n -> sub 1024 = n -> fma(n, sc, min)!
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             uint32_t pair = (raw >> (i * 8)) & 0xFFu;
             uint32_t u32 = (0x6400u | (pair & 0xFu)) | ((0x6400u | (pair >> 4)) << 16);
-            h[i] = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&u32), h1031), hsc);
+            h[i] = __hfma2(__hsub2(*reinterpret_cast<const __half2*>(&u32), h1024), hsc, hmin);
         }
     }
     return *reinterpret_cast<uint4*>(h);

@@ -105,6 +105,32 @@ pub extern "c" fn squid_cuda_graph_end_instantiate(stream: ?*anyopaque, out_exec
 pub extern "c" fn squid_cuda_graph_launch(exec: ?*anyopaque, stream: ?*anyopaque) i32;
 pub extern "c" fn squid_cuda_graph_destroy(exec: ?*anyopaque) i32;
 
+// --- Native Vision Tower (Host-RAM Staged Blackwell CUDA) ---
+
+pub extern "c" fn squid_vision_init(model_dir: [*:0]const u8) ?*anyopaque;
+pub extern "c" fn squid_vision_free(handle: ?*anyopaque) void;
+pub extern "c" fn squid_vision_encode_data_uri(
+    handle: ?*anyopaque,
+    uri: [*]const u8,
+    uri_len: usize,
+    max_tokens: i32,
+    stream: ?*anyopaque,
+    out_token_ids: [*]i32,
+    max_out_ids: i32,
+    out_embeds_ptr: *?[*]const f32,
+    out_num_tokens: *i32,
+) i32;
+pub extern "c" fn squid_vision_encode_file(
+    handle: ?*anyopaque,
+    path: [*:0]const u8,
+    max_tokens: i32,
+    stream: ?*anyopaque,
+    out_token_ids: [*]i32,
+    max_out_ids: i32,
+    out_embeds_ptr: *?[*]const f32,
+    out_num_tokens: *i32,
+) i32;
+
 // --- Weight Packing Kernels ---
 
 pub extern "c" fn squid_pack_bf16_to_nvfp4(
@@ -242,6 +268,20 @@ pub extern "c" fn squid_launch_qkvrg_fused(
     in_qh: *const anyopaque,
     in_kh: *const anyopaque,
     in_vh: *const anyopaque,
+    qrgs_out: [*]f32,
+    k_out: [*]f32,
+    v_out: [*]f32,
+    batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_qkvrg_fused_f32(
+    w_qrgs: *const CLinearWeight,
+    w_k: *const CLinearWeight,
+    w_v: *const CLinearWeight,
+    in_q: [*]const f32,
+    in_k: [*]const f32,
+    in_v: [*]const f32,
     qrgs_out: [*]f32,
     k_out: [*]f32,
     v_out: [*]f32,
@@ -499,6 +539,7 @@ pub extern "c" fn squid_launch_dspark_draft(
     out_draft_probs: ?[*]f32,
     out_draft_q_sel: ?[*]f32,
     out_draft_is_delta: ?*i32,
+    early_exit_thresh: f32,
     stream: ?*anyopaque,
 ) void;
 
@@ -570,6 +611,21 @@ pub extern "c" fn squid_launch_prefill_gemm_h(
     w: *const CLinearWeight,
     x_h: *const anyopaque,
     y: [*]f32,
+    w_f16_scratch: *anyopaque,
+    batch_size: i32,
+    stream: ?*anyopaque,
+) void;
+
+pub extern "c" fn squid_launch_prefill_qkv_h(
+    w_qrgs: *const CLinearWeight,
+    w_k: *const CLinearWeight,
+    w_v: *const CLinearWeight,
+    in_qh: *const anyopaque,
+    in_kh: *const anyopaque,
+    in_vh: *const anyopaque,
+    y_qrgs: [*]f32,
+    y_k: [*]f32,
+    y_v: [*]f32,
     w_f16_scratch: *anyopaque,
     batch_size: i32,
     stream: ?*anyopaque,

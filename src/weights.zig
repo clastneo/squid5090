@@ -844,13 +844,16 @@ fn stage_layer_raw(sf: *const safetensors.SafetensorsFile, layer_idx: u32, suffi
 }
 
 fn try_load_draft_vocab(model_directory: []const u8, quant_mode: constants.QuantMode) ?[]i32 {
-    if (quant_mode == .exact) return null;
+    // Draft vocab pruning ONLY affects the auxiliary DSpark drafter; the target model always
+    // runs the full 200,058-token exact BF16 unembed and strictly verifies every drafted token
+    // (0.000000 KLD change). In exact mode we prefer the richer bilingual 49K vocab by default.
     const env_dv = tiger.getenv("SQUID_DRAFT_VOCAB");
-    var prefer_49k: bool = false;
+    var prefer_49k: bool = (quant_mode == .exact);
     if (env_dv) |ptr| {
         const s = std.mem.span(ptr);
         if (std.mem.eql(u8, s, "full")) return null;
         if (std.mem.eql(u8, s, "49k")) prefer_49k = true;
+        if (std.mem.eql(u8, s, "32k")) prefer_49k = false;
     }
     const candidates: [2][]const u8 = if (prefer_49k)
         .{ "/draft_vocab_49k.bin", "/draft_vocab_32k.bin" }

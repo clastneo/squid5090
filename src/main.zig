@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const constants = @import("constants.zig");
+const cuda = @import("cuda.zig");
 const engine_mod = @import("engine.zig");
 const server_mod = @import("server.zig");
 const tiger = @import("tiger.zig");
@@ -32,6 +33,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var model_name: []const u8 = "inkling-2-mini";
     var model_name_explicit: bool = false;
     var ablation_path: []const u8 = "";
+    var image_path: []const u8 = "";
     var out_path: []const u8 = "";
     var ref_path: []const u8 = "";
     var effort: []const u8 = "none";
@@ -50,6 +52,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var ctx: u32 = if (std.mem.eql(u8, command, "serve")) 65536 else 8192;
     var use_graphs: bool = true;
     var use_prompt_lookup: bool = true;
+    var use_vision: bool = true;
+    var max_image_tokens: i32 = 1024;
     var embed_on_host: bool = false;
     var raw_prompt: bool = false;
     var raw_thinking: bool = false;
@@ -92,6 +96,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--ablation") and arg_i + 1 < argv.len) {
             arg_i += 1;
             ablation_path = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--image") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            image_path = std.mem.span(argv[arg_i]);
+        } else if (std.mem.eql(u8, arg, "--max-image-tokens") and arg_i + 1 < argv.len) {
+            arg_i += 1;
+            max_image_tokens = std.fmt.parseInt(i32, std.mem.span(argv[arg_i]), 10) catch 1024;
         } else if (std.mem.eql(u8, arg, "--out") and arg_i + 1 < argv.len) {
             arg_i += 1;
             out_path = std.mem.span(argv[arg_i]);
@@ -140,6 +150,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             use_graphs = false;
         } else if (std.mem.eql(u8, arg, "--no-prompt-lookup")) {
             use_prompt_lookup = false;
+        } else if (std.mem.eql(u8, arg, "--no-vision")) {
+            use_vision = false;
         } else if (std.mem.eql(u8, arg, "--raw")) {
             raw_prompt = true;
         } else if (std.mem.eql(u8, arg, "--raw-thinking")) {
@@ -207,7 +219,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     else
         .fp8;
 
-    if (ctx > 524_288 and quant_mode != .exact) {
+    if (ctx > 524_288) {
         embed_on_host = true;
     }
 
@@ -276,6 +288,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     };
     defer engine.deinit();
 
+    var vision_handle: ?*anyopaque = null;
+    const want_vision: bool = use_vision and (std.mem.eql(u8, command, "serve") or image_path.len > 0);
+    if (want_vision) {
+        var mdir_z: [1024]u8 = undefined;
+        if (model_directory.len < mdir_z.len) {
+            @memcpy(mdir_z[0..model_directory.len], model_directory);
+            mdir_z[model_directory.len] = 0;
+            vision_handle = cuda.squid_vision_init(@ptrCast(&mdir_z));
+        }
+    }
+    defer if (vision_handle != null) cuda.squid_vision_free(vision_handle);
+
     if (std.mem.eql(u8, command, "serve")) {
         return server_mod.run_openai_server(&engine, &tokenizer, .{
             .host = host,
@@ -290,6 +314,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .context_tokens_max = ctx,
             .raw_thinking = raw_thinking,
             .keep_history_thinking = keep_history_thinking,
+            .vision = vision_handle,
+            .max_image_tokens = max_image_tokens,
         });
     }
 
@@ -519,6 +545,59 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     defer tiger.free_host_slice(i32, out_tokens_buf);
 
     if (std.mem.eql(u8, command, "generate")) {
+        var cli_img_spans: [1]engine_mod.ImageSpan = undefined;
+        if (image_path.len > 0) {
+            if (vision_handle == null) {
+                tiger.print_stderr("Vision tower could not be loaded for --image '{s}'\n", .{image_path});
+                return 1;
+            }
+            var ipz: [1024]u8 = undefined;
+            if (image_path.len >= ipz.len) {
+                tiger.print_stderr("Image path too long: '{s}'\n", .{image_path});
+                return 1;
+            }
+            @memcpy(ipz[0..image_path.len], image_path);
+            ipz[image_path.len] = 0;
+
+            var scratch = tokenizer_mod.TokenizerScratch.init();
+            defer scratch.deinit();
+            var eff_buf: [128]u8 = undefined;
+            var ew = tiger.ByteWriter.init(&eff_buf);
+            _ = tokenizer_mod.Tokenizer.try_emit_thinking_effort(&ew, effort);
+
+            var p_len: usize = 0;
+            p_len += tokenizer.encode_into(ew.slice(), true, &scratch, prompt_ids_buf[p_len..]);
+            p_len += tokenizer.encode_into("<|message_user|><|content_image|>", true, &scratch, prompt_ids_buf[p_len..]);
+            var embeds_ptr: ?[*]const f32 = null;
+            var num_img_toks: i32 = 0;
+            const vrc = cuda.squid_vision_encode_file(
+                vision_handle,
+                @ptrCast(&ipz),
+                max_image_tokens,
+                engine.stream,
+                prompt_ids_buf[p_len..].ptr,
+                @intCast(@min(prompt_ids_buf.len - p_len, 4096)),
+                &embeds_ptr,
+                &num_img_toks,
+            );
+            if (vrc != 0 or embeds_ptr == null or num_img_toks <= 0) {
+                tiger.print_stderr("Failed to decode/encode --image '{s}' (rc={d})\n", .{ image_path, vrc });
+                return 1;
+            }
+            cli_img_spans[0] = .{
+                .start_pos = @intCast(p_len),
+                .count = @intCast(num_img_toks),
+                .embeds = embeds_ptr.?,
+            };
+            p_len += @intCast(num_img_toks);
+            p_len += tokenizer.encode_into("<|end_message|><|message_user|><|content_text|>", true, &scratch, prompt_ids_buf[p_len..]);
+            p_len += tokenizer.encode_into(prompt_text, false, &scratch, prompt_ids_buf[p_len..]);
+            p_len += tokenizer.encode_into("<|end_message|>", true, &scratch, prompt_ids_buf[p_len..]);
+            prompt_len = p_len;
+            engine.active_images = cli_img_spans[0..1];
+        }
+        defer engine.active_images = &.{};
+
         const st = engine.generate(prompt_ids_buf[0..prompt_len], max_tokens, mtp, out_tokens_buf, null, null);
         const dec_toks: f64 = @floatFromInt(if (st.generated_tokens > 0) st.generated_tokens - 1 else 0);
         const tps: f64 = if (st.decode_ms > 0.0) (dec_toks * 1000.0 / st.decode_ms) else 0.0;

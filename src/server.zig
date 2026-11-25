@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const constants = @import("constants.zig");
+const cuda = @import("cuda.zig");
 const engine_mod = @import("engine.zig");
 const tiger = @import("tiger.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -20,6 +21,7 @@ const prompt_tokens_max: usize = 1_048_576;
 const stop_sequences_max: usize = 8;
 const stop_sequence_max_bytes: usize = 64;
 const tool_calls_max: usize = 16;
+const request_images_max: usize = 32;
 
 var g_stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 var g_listen_fd: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1);
@@ -43,6 +45,8 @@ pub const ServerConfig = struct {
     context_tokens_max: u32 = 65536,
     raw_thinking: bool = false,
     keep_history_thinking: bool = false,
+    vision: ?*anyopaque = null,
+    max_image_tokens: i32 = 1024,
 };
 
 const StopList = struct {
@@ -361,8 +365,8 @@ pub fn run_openai_server(
     if (prng_state == 0) prng_state = 0x9e3779b97f4a7c15;
 
     tiger.print_stdout(
-        "[server] TigerStyle Zig OpenAI API listening on http://{s}:{d}/v1 (model={s}, ctx={d}, mtp={d}, zero-malloc=on)\n",
-        .{ config.host, config.port, config.model_name, config.context_tokens_max, config.default_mtp },
+        "[server] TigerStyle Zig OpenAI API listening on http://{s}:{d}/v1 (model={s}, ctx={d}, mtp={d}, vision={s}, zero-malloc=on)\n",
+        .{ config.host, config.port, config.model_name, config.context_tokens_max, config.default_mtp, if (config.vision != null) "on" else "off" },
     );
 
     const sock_timeout: tiger.Timeval = .{ .tv_sec = 30, .tv_usec = 0 };
@@ -708,6 +712,7 @@ fn handle_chat_completions(
     // Encode Inkling-2-Mini chat template directly into prompt_tokens:
     // server-emitted control tags use parse_special=true, while all untrusted user/tool/assistant text
     // uses parse_special=false (blocking control-token spoofing AND avoiding 32 MiB intermediate overflow!).
+    var image_spans: [request_images_max]engine_mod.ImageSpan = undefined;
     const enc_res = encode_chat_template_zero_alloc(
         tokenizer,
         messages_json,
@@ -715,12 +720,22 @@ fn handle_chat_completions(
         effort,
         config.keep_history_thinking,
         enable_thinking,
+        config.vision,
+        config.max_image_tokens,
+        engine.stream,
+        &image_spans,
         buffers,
     );
+    if (enc_res.image_err) |ierr| {
+        send_error_json(fd, 400, ierr, "invalid_request_error", buffers.response_buf);
+        return;
+    }
     if (enc_res.overflow) {
         send_error_json(fd, 413, "Rendered prompt exceeds static buffer or max_context", "invalid_request_error", buffers.response_buf);
         return;
     }
+    engine.active_images = image_spans[0..enc_res.image_count];
+    defer engine.active_images = &.{};
     const system_prefix_tokens: u32 = enc_res.system_prefix_tokens;
     const prompt_len: usize = enc_res.prompt_len;
     if (prompt_len == 0 or prompt_len >= config.context_tokens_max) {
@@ -1298,6 +1313,8 @@ fn send_chat_sse_tool_calls(
 const ChatEncodeResult = struct {
     prompt_len: usize = 0,
     system_prefix_tokens: u32 = 0,
+    image_count: usize = 0,
+    image_err: ?[]const u8 = null,
     overflow: bool = false,
 };
 
@@ -1337,9 +1354,15 @@ fn encode_chat_template_zero_alloc(
     effort: []const u8,
     keep_history_thinking: bool,
     enable_thinking: bool,
+    vision: ?*anyopaque,
+    max_image_tokens: i32,
+    cuda_stream: ?*anyopaque,
+    image_spans: *[request_images_max]engine_mod.ImageSpan,
     buffers: *ServerBuffers,
 ) ChatEncodeResult {
     var out_len: usize = 0;
+    var image_count: usize = 0;
+    var image_err: ?[]const u8 = null;
     var overflow: bool = false;
     const scratch = buffers.scratch_str_buf;
 
@@ -1394,7 +1417,7 @@ fn encode_chat_template_zero_alloc(
     var effort_render: [128]u8 = undefined;
     var pos: usize = 1; // skip '['
     var msg_iter: u32 = 0;
-    while (pos < messages_json.len and msg_iter < 1024 and !overflow) : (msg_iter += 1) {
+    while (pos < messages_json.len and msg_iter < 1024 and !overflow and image_err == null) : (msg_iter += 1) {
         tokenizer_mod.skip_ws(messages_json, &pos);
         if (pos >= messages_json.len or messages_json[pos] == ']') break;
         if (messages_json[pos] != '{') {
@@ -1491,7 +1514,70 @@ fn encode_chat_template_zero_alloc(
                         const ps_start = ap;
                         tokenizer_mod.skip_json_value(c_raw, &ap);
                         const part_obj = c_raw[ps_start..ap];
-                        if (extract_string_field(part_obj, "text", scratch)) |ts| {
+                        var ptype_buf: [32]u8 = undefined;
+                        const ptype = extract_string_field(part_obj, "type", &ptype_buf) orelse "text";
+                        const is_img_part: bool = std.mem.eql(u8, ptype, "image_url") or
+                            std.mem.eql(u8, ptype, "image") or
+                            std.mem.eql(u8, ptype, "input_image");
+                        if (is_img_part) {
+                            var img_uri: ?[]const u8 = null;
+                            if (extract_raw_field(part_obj, "image_url")) |iu_raw| {
+                                if (iu_raw.len > 0 and iu_raw[0] == '"') {
+                                    var up: usize = 0;
+                                    img_uri = tokenizer_mod.parse_json_string(iu_raw, &up, scratch);
+                                } else if (iu_raw.len > 0 and iu_raw[0] == '{') {
+                                    img_uri = extract_string_field(iu_raw, "url", scratch);
+                                }
+                            } else if (extract_string_field(part_obj, "url", scratch)) |u| {
+                                img_uri = u;
+                            } else if (extract_string_field(part_obj, "image", scratch)) |u| {
+                                img_uri = u;
+                            }
+                            if (img_uri) |uri| {
+                                if (vision == null) {
+                                    image_err = "Vision tower is not loaded on this server";
+                                    break;
+                                }
+                                if (image_count >= request_images_max) {
+                                    image_err = "Too many images in a single request (max 32)";
+                                    break;
+                                }
+                                emitted_assistant_block = true;
+                                append_encoded_segment(tokenizer, role_tok, true, buffers, &out_len, &overflow);
+                                if (resolved_name) |nm| append_encoded_segment(tokenizer, nm, false, buffers, &out_len, &overflow);
+                                append_encoded_segment(tokenizer, "<|content_image|>", true, buffers, &out_len, &overflow);
+                                if (!overflow) {
+                                    const cap_rem: usize = buffers.prompt_tokens.len - out_len;
+                                    const max_ids: i32 = @intCast(@min(cap_rem, 4096));
+                                    var embeds_ptr: ?[*]const f32 = null;
+                                    var num_toks: i32 = 0;
+                                    const rc = cuda.squid_vision_encode_data_uri(
+                                        vision,
+                                        uri.ptr,
+                                        uri.len,
+                                        max_image_tokens,
+                                        cuda_stream,
+                                        buffers.prompt_tokens[out_len..].ptr,
+                                        max_ids,
+                                        &embeds_ptr,
+                                        &num_toks,
+                                    );
+                                    if (rc != 0 or embeds_ptr == null or num_toks <= 0) {
+                                        image_err = "Failed to decode or encode image (expect base64 PNG/JPEG/GIF/BMP data URI)";
+                                        break;
+                                    }
+                                    image_spans[image_count] = .{
+                                        .start_pos = @intCast(out_len),
+                                        .count = @intCast(num_toks),
+                                        .embeds = embeds_ptr.?,
+                                    };
+                                    image_count += 1;
+                                    out_len += @intCast(num_toks);
+                                    if (out_len >= buffers.prompt_tokens.len) overflow = true;
+                                }
+                                append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, &out_len, &overflow);
+                            }
+                        } else if (extract_string_field(part_obj, "text", scratch)) |ts| {
                             emitted_assistant_block = true;
                             append_encoded_segment(tokenizer, role_tok, true, buffers, &out_len, &overflow);
                             if (resolved_name) |nm| append_encoded_segment(tokenizer, nm, false, buffers, &out_len, &overflow);
@@ -1582,6 +1668,8 @@ fn encode_chat_template_zero_alloc(
     return .{
         .prompt_len = out_len,
         .system_prefix_tokens = system_prefix_tokens,
+        .image_count = image_count,
+        .image_err = image_err,
         .overflow = overflow,
     };
 }

@@ -97,9 +97,9 @@ struct SampleConfig {
 constexpr int KV_SPLIT_K = 64;    // 8 KV heads x 64 bulk splits = 512 CTAs (3.0 blocks/SM!)
 constexpr int KV_LOCAL_SPLITS = 17; // 17 x 64 = 1088 >= 1024+8 (1 single tile per CTA!)
 constexpr int KV_TOTAL_SPLITS = KV_SPLIT_K + KV_LOCAL_SPLITS; // 81 slots in split_buf
-constexpr int KV_Q4_GROUP = 64;  // 2 groups per 128-dim head
-constexpr int KV_Q4_GROUPS_PER_HEAD = HEAD_DIM / KV_Q4_GROUP; // 2
-constexpr int KV_Q4_SCALES_PER_TOK = NUM_KV_HEADS * KV_Q4_GROUPS_PER_HEAD; // 16
+constexpr int KV_Q4_GROUP = 32;  // 4 groups per 128-dim head (1 warp/group, zero-sync!)
+constexpr int KV_Q4_GROUPS_PER_HEAD = HEAD_DIM / KV_Q4_GROUP; // 4
+constexpr int KV_Q4_SCALES_PER_TOK = NUM_KV_HEADS * KV_Q4_GROUPS_PER_HEAD * 2; // 64 halfs (asymmetric scale+min pairs)
 
 struct VisitInfo {
     int visit_idx;

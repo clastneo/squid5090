@@ -43,10 +43,10 @@ pub const mtp_draft_count_max: u32 = 7;
 pub const mtp_markov_rank: u32 = 256;
 pub const mtp_target_visits: [4]u32 = .{ 5, 23, 41, 48 };
 
-// FlashDecoding Split-K and Q4 KV constants
-pub const kv_q4_group_size: u32 = 64;
-pub const kv_q4_groups_per_head: u32 = head_dim / kv_q4_group_size; // 2
-pub const kv_q4_scales_per_token: u32 = kv_head_count * kv_q4_groups_per_head; // 16
+// FlashDecoding Split-K and Q4 KV constants (Group-32 asymmetric scale+min)
+pub const kv_q4_group_size: u32 = 32;
+pub const kv_q4_groups_per_head: u32 = head_dim / kv_q4_group_size; // 4
+pub const kv_q4_scales_per_token: u32 = kv_head_count * kv_q4_groups_per_head * 2; // 64 halfs (scale+min pairs)
 pub const split_buffer_floats: u64 = 2_050_000;
 pub const dspark_workspace_floats: u64 = 2_000_000;
 

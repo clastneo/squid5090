@@ -90,6 +90,18 @@ void launch_qkvrg_fused(
     int B,
     cudaStream_t stream);
 
+// Fused BF16 Q+R+Gate+Sink (6552) + K (1024) + V (1024) on FP32 activations (Blackwell TC MMA + PDL)!
+void launch_qkvrg_fused_f32(
+    const LayerWeights& lw,
+    const float* in_q,
+    const float* in_k,
+    const float* in_v,
+    float* qrgs_out,  // [B, 6552]
+    float* k_out,     // [B, 1024]
+    float* v_out,     // [B, 1024]
+    int B,
+    cudaStream_t stream);
+
 void launch_f32_to_f16(const float* src, __half* dst, int n, cudaStream_t stream);
 
 // MoE Gate+Up + Softcapped SwiGLU (reads half x, writes half out_act!)
@@ -456,6 +468,7 @@ void launch_dspark_draft(
     float* out_draft_probs,        // optional [num_drafts, draft_vocab_size] normalized q_i(v)
     float* out_draft_q_sel,        // optional [num_drafts] q_i(out_draft_tokens[i])
     int32_t* out_draft_is_delta,   // optional [1] cleared to 0 by DSpark
+    float early_exit_thresh,       // >0: bit-exact Markov early exit when prior conf < thresh
     cudaStream_t stream);
 
 // GPU verification kernel: compares target's predicted tokens [B] against draft tokens [B-1],
@@ -479,6 +492,20 @@ void launch_prefill_gemm_h(
     const LinearWeight& w,
     const __half* x_h,
     float* y,
+    __half* w_f16_scratch,
+    int B,
+    cudaStream_t stream);
+
+void launch_prefill_qkv_h(
+    const LinearWeight& w_qrgs,
+    const LinearWeight& w_k,
+    const LinearWeight& w_v,
+    const __half* in_qh,
+    const __half* in_kh,
+    const __half* in_vh,
+    float* y_qrgs,
+    float* y_k,
+    float* y_v,
     __half* w_f16_scratch,
     int B,
     cudaStream_t stream);

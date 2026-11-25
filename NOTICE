@@ -37,3 +37,11 @@ following open-source projects:
 
 4. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
    Thinking Machines / Inkling-2-Mini.
+
+5. Inkling-2 Vision Tower CUDA kernels & image preprocessing (Apache License 2.0)
+   Adapted from satellitedown/inkling-2-mini-abliterated-ingine into cuda/vision.cu
+   for zero-permanent-VRAM host-RAM layer streaming.
+
+6. stb_image.h (MIT License / Public Domain, Sean Barrett)
+   https://github.com/nothings/stb
+   Single-header PNG/JPEG/GIF/BMP decoder in cuda/third_party/stb/stb_image.h.

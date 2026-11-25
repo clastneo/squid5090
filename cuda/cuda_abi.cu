@@ -599,6 +599,17 @@ void squid_launch_qkvrg_fused(
                        static_cast<const __half*>(in_vh), qrgs_out, k_out, v_out, B, static_cast<cudaStream_t>(stream));
 }
 
+void squid_launch_qkvrg_fused_f32(
+    const CLinearWeight* w_qrgs, const CLinearWeight* w_k, const CLinearWeight* w_v,
+    const float* in_q, const float* in_k, const float* in_v,
+    float* qrgs_out, float* k_out, float* v_out, int32_t B, void* stream) {
+    LayerWeights lw;
+    lw.w_qrgs = to_lw(*w_qrgs);
+    lw.w_k = to_lw(*w_k);
+    lw.w_v = to_lw(*w_v);
+    launch_qkvrg_fused_f32(lw, in_q, in_k, in_v, qrgs_out, k_out, v_out, B, static_cast<cudaStream_t>(stream));
+}
+
 void squid_launch_linear(const CLinearWeight* w, const float* x, float* y, int32_t B, uint8_t add_res, void* stream) {
     launch_linear(to_lw(*w), x, y, B, add_res != 0, static_cast<cudaStream_t>(stream));
 }
@@ -744,7 +755,7 @@ void squid_launch_dspark_draft(
     const int32_t* ctx_cap, uint8_t global_kv_fmt, float* split_buf,
     const float* f_ring, float* workspace, int32_t* out_draft_tokens, float* out_draft_conf,
     const SampleConfig* sample_cfg, float* out_draft_probs, float* out_draft_q_sel,
-    int32_t* out_draft_is_delta, void* stream) {
+    int32_t* out_draft_is_delta, float early_exit_thresh, void* stream) {
     ModelWeights mw;
     mw.embed = const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(embed));
     mw.embed_norm = const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(embed_norm));
@@ -757,7 +768,7 @@ void squid_launch_dspark_draft(
     launch_dspark_draft(mw, d_anchor_token, d_pos, num_drafts, ck, cv, cks, cvs, cap,
                         static_cast<KVFormat>(global_kv_fmt), split_buf, f_ring, workspace,
                         out_draft_tokens, out_draft_conf, sample_cfg, out_draft_probs,
-                        out_draft_q_sel, out_draft_is_delta, static_cast<cudaStream_t>(stream));
+                        out_draft_q_sel, out_draft_is_delta, early_exit_thresh, static_cast<cudaStream_t>(stream));
 }
 
 int32_t squid_adaptive_graph_create(
@@ -893,6 +904,17 @@ void squid_launch_prefill_gemm_h(
     launch_prefill_gemm_h(
         to_lw(*w), static_cast<const __half*>(x_h), y, static_cast<__half*>(w_f16_scratch),
         B, static_cast<cudaStream_t>(stream));
+}
+
+void squid_launch_prefill_qkv_h(
+    const CLinearWeight* w_qrgs, const CLinearWeight* w_k, const CLinearWeight* w_v,
+    const void* in_qh, const void* in_kh, const void* in_vh,
+    float* y_qrgs, float* y_k, float* y_v,
+    void* w_f16_scratch, int32_t B, void* stream) {
+    launch_prefill_qkv_h(
+        to_lw(*w_qrgs), to_lw(*w_k), to_lw(*w_v),
+        static_cast<const __half*>(in_qh), static_cast<const __half*>(in_kh), static_cast<const __half*>(in_vh),
+        y_qrgs, y_k, y_v, static_cast<__half*>(w_f16_scratch), B, static_cast<cudaStream_t>(stream));
 }
 
 void squid_launch_prefill_sconv_post_res(
